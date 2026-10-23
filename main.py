@@ -106,7 +106,15 @@ _DEFAULT_STRONG_PATTERNS = [
 ]
 
 _RE_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
-_RE_JSON_OBJ = re.compile(r"\{[^{}]{0,4000}\}", re.S)
+# 只对“以 { " 开头”的片段做真正的 JSON 解析（跳过代码里的花括号）
+_RE_JSON_OBJ_START = re.compile(r'\{\s*"')
+_MAX_JSON_TRIES = 16
+_MAX_JSON_SLICE = 16_384
+_MAX_JSON_PROBES = 512   # 只检查前 512 个 "{"，防止满屏花括号拖慢事件循环
+
+# 处理状态记在消息对象上，而不是记在正文里：
+# 正文可被攻击者伪造，对象属性不能；同时避免“标注文本被自己二次命中”。
+_STATE_ATTR = "_pd_defense_done"
 _RE_AT_PREFIX = re.compile(r"^@\S+\s*")
 
 # JSON 信封特征：伪造一条“消息对象”（sender_id/session_id/… + content）
@@ -185,6 +193,20 @@ class PayloadDefensePlugin(BasePlugin):
                 self._strong_compiled.append((p, re.compile(p, re.IGNORECASE | re.MULTILINE)))
             except re.error as e:
                 logger.warning(f"bad strong pattern skipped: {p!r} ({e})")
+
+    @staticmethod
+    def _mark_done(message):
+        try:
+            setattr(message, _STATE_ATTR, True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_done(message) -> bool:
+        try:
+            return bool(getattr(message, _STATE_ATTR, False))
+        except Exception:
+            return False
 
     def _vlog(self, msg: str):
         if self._verbose:
@@ -369,27 +391,41 @@ class PayloadDefensePlugin(BasePlugin):
                 continue
         return hits
 
+    @staticmethod
+    def _is_envelope(obj: dict) -> bool:
+        keys = {str(k).lower() for k in obj.keys()}
+        env = keys & _ENV_KEYS
+        return len(env) >= 3 or (len(env) >= 2 and bool(keys & _BODY_KEYS))
+
     def _json_envelope_hit(self, text: str) -> bool:
         """JSON 信封：对象里同时出现 >=3 个系统键，或 >=2 个系统键 + 正文键。
 
         覆盖 README 的模板2（sender_id + session_id + content 只有 2 条弱命中，
         单靠 min_hits=3 永远拦不到）。
+        用 raw_decode 逐段解析，能正确处理嵌套对象与转义引号（正则版会漏）。
         """
         if not self._json_envelope:
             return False
         probe = self._clip(text)
         if "{" not in probe:
             return False
-        for m in _RE_JSON_OBJ.finditer(probe):
+        dec = _json.JSONDecoder()
+        pos, tried, probes = -1, 0, 0
+        while tried < _MAX_JSON_TRIES and probes < _MAX_JSON_PROBES:
+            pos = probe.find("{", pos + 1)
+            if pos < 0:
+                break
+            probes += 1
+            if not _RE_JSON_OBJ_START.match(probe, pos):
+                continue
+            tried += 1
             try:
-                obj = _json.loads(m.group(0))
+                # 只在有界片段里解析：单条消息的 JSON 信封远小于 16KB，
+                # 这样最坏情况（满屏花括号）也只花几毫秒，不会阻塞事件循环。
+                obj, _ = dec.raw_decode(probe[pos : pos + _MAX_JSON_SLICE])
             except Exception:
                 continue
-            if not isinstance(obj, dict):
-                continue
-            keys = {str(k).lower() for k in obj.keys()}
-            env = keys & _ENV_KEYS
-            if len(env) >= 3 or (len(env) >= 2 and (keys & _BODY_KEYS)):
+            if isinstance(obj, dict) and self._is_envelope(obj):
                 return True
         return False
 
@@ -540,6 +576,8 @@ class PayloadDefensePlugin(BasePlugin):
         if self._is_whitelisted(qq):
             return
 
+        if self._is_done(getattr(event, "message", None)):
+            return
         text = self._extract_text_message(getattr(event, "message", None))
         if not text:
             return
@@ -553,6 +591,7 @@ class PayloadDefensePlugin(BasePlugin):
             try:
                 event.discard(force=True)
                 event.stop()
+                self._mark_done(getattr(event, "message", None))
                 logger.info(
                     f"DEFENSE strict qq={qq or '?'} owner={owner} hits={len(hits)} "
                     f"strong={len(strong)} preview={text[:160]!r}"
@@ -564,6 +603,9 @@ class PayloadDefensePlugin(BasePlugin):
         if self._mode == "annotate":
             annotated = self._build_annotate_user(text, hits, strong)
             ok = self._apply_chain(event, annotated)
+            if ok:
+                # 只有真的改成功才打标；否则留给 llm 层兜底重试（不能 fail-open）
+                self._mark_done(getattr(event, "message", None))
             logger.info(
                 f"DEFENSE annotate qq={qq or '?'} owner={owner} hits={len(hits)} "
                 f"strong={len(strong)} ok={ok}"
@@ -573,6 +615,8 @@ class PayloadDefensePlugin(BasePlugin):
 
         # warn
         ok = self._apply_chain(event, WARN_REPLACE)
+        if ok:
+            self._mark_done(getattr(event, "message", None))
         logger.info(
             f"DEFENSE warn qq={qq or '?'} owner={owner} hits={len(hits)} "
             f"strong={len(strong)} ok={ok} preview={text[:160]!r}"
@@ -621,7 +665,7 @@ class PayloadDefensePlugin(BasePlugin):
         targets = []
         for i, msg in enumerate(messages):
             qq = self._sender_qq_from_msg(msg)
-            if self._is_whitelisted(qq):
+            if self._is_whitelisted(qq) or self._is_done(msg):
                 continue
             raw = self._extract_text_message(msg)
             if not raw:
@@ -642,7 +686,7 @@ class PayloadDefensePlugin(BasePlugin):
         groups: dict[str, list[tuple[int, str]]] = {}
         for i, msg in enumerate(messages):
             qq = self._sender_qq_from_msg(msg)
-            if self._is_whitelisted(qq):
+            if self._is_whitelisted(qq) or self._is_done(msg):
                 continue
             raw = self._extract_text_message(msg)
             if not raw:
@@ -670,7 +714,8 @@ class PayloadDefensePlugin(BasePlugin):
             return
 
         targets = self._batch_targets(messages)
-        if not targets:
+        already_done = any(self._is_done(m) for m in messages)
+        if not targets and not already_done:
             return
 
         prompts = self._message_prompts(req)
@@ -685,6 +730,7 @@ class PayloadDefensePlugin(BasePlugin):
                 annotated = self._build_annotate_user(raw, hits, strong)
                 if i < len(prompts):
                     self._patch_prompt(prompts[i], _needles(i, raw), annotated)
+                self._mark_done(messages[i])
                 logger.info(
                     f"DEFENSE annotate@llm idx={i} hits={len(hits)} strong={len(strong)}"
                 )
@@ -695,6 +741,7 @@ class PayloadDefensePlugin(BasePlugin):
             for i, raw, hits, strong in targets:
                 if i < len(prompts):
                     self._patch_prompt(prompts[i], _needles(i, raw), WARN_REPLACE)
+                self._mark_done(messages[i])
                 logger.info(
                     f"DEFENSE warn@llm idx={i} hits={len(hits)} strong={len(strong)}"
                 )
@@ -705,6 +752,7 @@ class PayloadDefensePlugin(BasePlugin):
         for i, raw, hits, strong in targets:
             if i < len(prompts):
                 self._patch_prompt(prompts[i], _needles(i, raw), WARN_REPLACE)
+            self._mark_done(messages[i])
             logger.info(
                 f"DEFENSE strict-fallback@llm idx={i} hits={len(hits)} strong={len(strong)}"
             )
