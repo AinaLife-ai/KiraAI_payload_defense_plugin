@@ -105,6 +105,15 @@ _DEFAULT_STRONG_PATTERNS = [
     r"user_id[:：][ \t]*[^\]\n]{1,64}\][ \t]*\|",
 ]
 
+# 昵称里的伪造片段（框架会原样把昵称拼进消息头，等价于伪造一条消息头）
+_RE_HEADER_BREAK = re.compile(r"\]\s*\|")
+_RE_NICK_SIGNALS = (
+    re.compile(r"user_id\s*[:：]\s*\d"),
+    re.compile(r"\]\s*\|"),
+    re.compile(r"\[?message_id\s*[:：]"),
+    re.compile(r"(?:group_name|user_nickname|sender_nickname|sender_id)\s*[:：]"),
+)
+
 _RE_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
 # 只对“以 { " 开头”的片段做真正的 JSON 解析（跳过代码里的花括号）
 _RE_JSON_OBJ_START = re.compile(r'\{\s*"')
@@ -117,11 +126,14 @@ _MAX_JSON_PROBES = 512   # 只检查前 512 个 "{"，防止满屏花括号拖�
 _STATE_ATTR = "_pd_defense_done"
 _RE_AT_PREFIX = re.compile(r"^@\S+\s*")
 
-# JSON 信封特征：伪造一条“消息对象”（sender_id/session_id/… + content）
-_ENV_KEYS = {
+# JSON 信封特征：伪造一条“消息对象”。
+# 分成强/弱两类：强键是 KiraAI 消息体特有的，弱键(user_id/group_id/…)在普通业务 JSON 里很常见，
+# 单独出现不构成伪造（否则 {"session":…,"user_id":5,"content":…} 这类正常示例会被误杀）。
+_ENV_KEYS_STRONG = {
     "sender_id", "session_id", "sender_nickname", "sender_type",
-    "message_id", "user_id", "group_id", "session",
+    "message_id", "session_type",
 }
+_ENV_KEYS_WEAK = {"user_id", "group_id"}
 _BODY_KEYS = {"content", "message", "text", "prompt", "msg", "reply"}
 _RE_SYSLOG_META = re.compile(
     r"\[message_id:[^\]]*\]|\[group_name:[^\]]*\]|\[user_nickname:[^\]]*\]|"
@@ -394,8 +406,10 @@ class PayloadDefensePlugin(BasePlugin):
     @staticmethod
     def _is_envelope(obj: dict) -> bool:
         keys = {str(k).lower() for k in obj.keys()}
-        env = keys & _ENV_KEYS
-        return len(env) >= 3 or (len(env) >= 2 and bool(keys & _BODY_KEYS))
+        strong = keys & _ENV_KEYS_STRONG
+        weak = keys & _ENV_KEYS_WEAK
+        # 2 个强字段 + 正文键 = 一条伪造的消息对象；或字段总数 >=3
+        return (len(strong) >= 2 and bool(keys & _BODY_KEYS)) or (len(strong) + len(weak) >= 3)
 
     def _json_envelope_hit(self, text: str) -> bool:
         """JSON 信封：对象里同时出现 >=3 个系统键，或 >=2 个系统键 + 正文键。
@@ -646,6 +660,45 @@ class PayloadDefensePlugin(BasePlugin):
             if getattr(p, "name", None) == "message"
         ]
 
+    @classmethod
+    def _identity_is_forged(cls, value) -> bool:
+        """昵称/群名本身就含有消息头结构（框架会把它原样拼进消息头）。"""
+        if not value:
+            return False
+        s = str(value)
+        if len(s) > 200:
+            return False
+        # 只要出现 "]" + "|" 就能把消息头的结构拆开
+        if _RE_HEADER_BREAK.search(s):
+            return True
+        return sum(1 for r in _RE_NICK_SIGNALS if r.search(s)) >= 2
+
+    def _guard_identity(self, messages: list, prompts: list) -> int:
+        """把“伪造消息头”的昵称/群名在已渲染的 prompt 里去毒。
+
+        只改送给 LLM 的文本，不改框架对象；攻击面是 header 由昵称/群名直接拼接而成。
+        """
+        fixed = 0
+        for i, msg in enumerate(messages):
+            if i >= len(prompts):
+                break
+            content = getattr(prompts[i], "content", "") or ""
+            origin = content
+            candidates = (
+                getattr(getattr(msg, "sender", None), "nickname", None),
+                getattr(getattr(msg, "group", None), "group_name", None),
+            )
+            for value in candidates:
+                if not self._identity_is_forged(value):
+                    continue
+                raw = str(value)
+                if raw and raw in content:
+                    content = content.replace(raw, self._defang(raw).replace("|", "｜"))
+            if content != origin:
+                prompts[i].content = content
+                fixed += 1
+        return fixed
+
     def _patch_prompt(self, prompt, needles: list[str], new_text: str) -> bool:
         """只替换正文，保留框架已拼好的真实消息头（发言人身份不丢）。"""
         try:
@@ -713,12 +766,20 @@ class PayloadDefensePlugin(BasePlugin):
         if not messages:
             return
 
+        prompts = self._message_prompts(req)
+
+        # 昵称伪造防护：框架会把昵称原样拼进消息头，等于允许用昵称伪造发言人。
+        # 只改送给 LLM 的文本，不动框架对象。
+        nick_fixed = self._guard_identity(messages, prompts)
+
         targets = self._batch_targets(messages)
         already_done = any(self._is_done(m) for m in messages)
         if not targets and not already_done:
+            if nick_fixed:
+                logger.info(f"DEFENSE nickname-sanitized count={nick_fixed}")
             return
-
-        prompts = self._message_prompts(req)
+        if nick_fixed:
+            logger.info(f"DEFENSE nickname-sanitized count={nick_fixed}")
 
         def _needles(i: int, raw: str) -> list[str]:
             # 优先用 message_str（已被 formatter 归一化，最可能原样出现在 prompt 里）
