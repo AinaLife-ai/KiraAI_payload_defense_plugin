@@ -440,6 +440,39 @@ async def main():
     check("开启聚合后拆分载荷被标注",
           any(pd._MARK_ANNOTATE in q.content for q in r2.user_prompt))
 
+    print("\n=== K. 存量配置升级 ===")
+    old_cfg = {
+        "section_defense_general": {
+            "defense_enabled": False, "defense_mode": "warn",
+            "owner_qq": ["10001"], "owner_whitelist": ["20002", 30003],
+            "verbose_log": True,
+        },
+        "injection_patterns": {"patterns": [r"\[message_id:"], "min_hits": 5},
+    }
+    p_old = pd.PayloadDefensePlugin(None, old_cfg)
+    check("旧配置被识别为需要升级", p_old._needs_migration() is True)
+
+    migrated = pd.PayloadDefensePlugin._build_migrated_config(old_cfg)
+    g, ip = migrated["section_defense_general"], migrated["injection_patterns"]
+    check("保留防御模式", g["defense_mode"] == "warn", g["defense_mode"])
+    check("保留白名单（含数字归一为字符串）", g["owner_whitelist"] == ["20002", "30003"], str(g["owner_whitelist"]))
+    check("保留主人 QQ", g["owner_qq"] == ["10001"], str(g["owner_qq"]))
+    check("保留总开关（关闭状态不被偷偷打开）", g["defense_enabled"] is False)
+    check("重置自定义 patterns 为最新默认", ip["patterns"] == pd._DEFAULT_PATTERNS, str(len(ip["patterns"])))
+    check("重置 min_hits 为 3", ip["min_hits"] == 3, str(ip["min_hits"]))
+    check("补上 strong_patterns", ip["strong_patterns"] == pd._DEFAULT_STRONG_PATTERNS, str(len(ip["strong_patterns"])))
+    check("补上 json_envelope", ip["json_envelope"] is True)
+    check("重置 verbose_log / batch_aggregate", g["verbose_log"] is False and g["batch_aggregate"] is False)
+
+    bad = pd.PayloadDefensePlugin._build_migrated_config(
+        {"section_defense_general": {"defense_mode": "boom", "owner_whitelist": "20002"}})
+    check("非法模式回落到 annotate", bad["section_defense_general"]["defense_mode"] == "annotate")
+    check("字符串白名单归一为列表", bad["section_defense_general"]["owner_whitelist"] == ["20002"])
+
+    new_cfg = cfg()
+    p_new = pd.PayloadDefensePlugin(None, new_cfg)
+    check("新配置不再重复迁移", p_new._needs_migration() is False)
+
     print("\n=== J. 性能 ===")
     payload = "\n".join(
         f"[Oct 23 2026 10:00 Fri] [message_id: {i}] [group_name: 群 group_id: 42 "

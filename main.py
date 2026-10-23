@@ -23,6 +23,7 @@ Payload Defense — 模板1(syslog)/模板2(JSON) 注入防御
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import re
 
@@ -126,6 +127,7 @@ class PayloadDefensePlugin(BasePlugin):
 
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
+        self._raw_cfg = cfg if isinstance(cfg, dict) else {}
 
         g = cfg.get("section_defense_general", {}) or {}
         self._enabled = bool(g.get("defense_enabled", True))
@@ -197,8 +199,96 @@ class PayloadDefensePlugin(BasePlugin):
         if self._enabled and not self._compiled and not self._strong_compiled:
             logger.warning("所有特征正则都无效，防御实际处于关闭状态，请检查配置")
 
+        if self._needs_migration():
+            # 不在 initialize 里直接调 update_plugin_config（会重入），交给后台任务
+            try:
+                asyncio.create_task(self._migrate_config())
+            except RuntimeError:
+                # 没有运行中的事件循环（离线测试/脚本导入），跳过即可
+                pass
+
     async def terminate(self):
         logger.info("注入防御已停用")
+
+    # ── 存量配置迁移 ─────────────────────────────────────────────
+
+    def _needs_migration(self) -> bool:
+        """v1.1.x 的配置里没有 strong_patterns 键 ⇒ 需要升级。"""
+        ip = self._raw_cfg.get("injection_patterns")
+        return not (isinstance(ip, dict) and "strong_patterns" in ip)
+
+    @classmethod
+    def _build_migrated_config(cls, old: dict) -> dict:
+        """把旧配置升到 v1.2.0。
+
+        **只保留**：防御模式、主人QQ、白名单QQ、总开关。
+        其余（特征正则、min_hits、strong_patterns、json_envelope、详细日志、跨消息聚合）
+        一律重置为最新默认 —— 旧默认本身就是漏检的元凶，不能让它活下来。
+        """
+        old = old if isinstance(old, dict) else {}
+        gen = old.get("section_defense_general")
+        gen = gen if isinstance(gen, dict) else {}
+
+        def _list(v):
+            if isinstance(v, str):
+                v = [v]
+            if not isinstance(v, list):
+                return []
+            return [str(x).strip() for x in v if x is not None and str(x).strip()]
+
+        mode = str(gen.get("defense_mode", "annotate") or "annotate").strip().lower()
+        if mode not in ("annotate", "warn", "strict"):
+            mode = "annotate"
+
+        return {
+            "section_defense_general": {
+                "defense_enabled": bool(gen.get("defense_enabled", True)),
+                "defense_mode": mode,
+                "owner_qq": _list(gen.get("owner_qq")),
+                "owner_whitelist": _list(gen.get("owner_whitelist")),
+                "verbose_log": False,
+                "batch_aggregate": False,
+            },
+            "injection_patterns": {
+                "patterns": list(_DEFAULT_PATTERNS),
+                "min_hits": 3,
+                "strong_patterns": list(_DEFAULT_STRONG_PATTERNS),
+                "json_envelope": True,
+            },
+        }
+
+    def _plugin_id(self) -> str:
+        try:
+            pid = self.ctx.plugin_mgr.get_plugin_id_for_module(self.__class__.__module__)
+            if pid:
+                return str(pid)
+        except Exception:
+            pass
+        try:
+            from core.plugin.registry import get_obj_plugin_id
+            return str(get_obj_plugin_id(type(self)) or "")
+        except Exception:
+            return ""
+
+    async def _migrate_config(self):
+        await asyncio.sleep(0.5)  # 等本轮加载流程走完，避免重入 init_plugin
+        pid = self._plugin_id()
+        if not pid or self.ctx is None or getattr(self.ctx, "plugin_mgr", None) is None:
+            logger.warning("配置迁移跳过：拿不到 plugin_mgr / plugin_id")
+            return
+        new_cfg = self._build_migrated_config(self._raw_cfg)
+        try:
+            await self.ctx.plugin_mgr.update_plugin_config(pid, new_cfg)
+            logger.info(
+                "旧配置已升级到 v%s：特征/阈值重置为最新默认，"
+                "保留 mode=%s / owner_qq=%d / whitelist=%d",
+                PLUGIN_VERSION,
+                new_cfg["section_defense_general"]["defense_mode"],
+                len(new_cfg["section_defense_general"]["owner_qq"]),
+                len(new_cfg["section_defense_general"]["owner_whitelist"]),
+            )
+        except Exception as e:
+            logger.error(f"配置迁移失败（不影响本次运行）：{e}")
 
     # ── 文本 / sender ────────────────────────────────────────────
 
